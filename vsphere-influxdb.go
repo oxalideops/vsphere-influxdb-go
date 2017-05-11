@@ -606,7 +606,7 @@ func (vcenter *VCenter) Query(config Configuration, InfluxDBClient influxclient.
 		for _, pool := range respool {
 			respoolFields := map[string]interface{}{
 				"cpu_limit":    pool.Config.CpuAllocation.GetResourceAllocationInfo().Limit,
-				"memory_limit": pool.Config.MemoryAllocation.GetResourceAllocationInfo().Limit,
+				"memory_limit": MBToKB(pool.Config.MemoryAllocation.GetResourceAllocationInfo().Limit),
 			}
 			respoolTags := map[string]string{"pool_name": pool.Name}
 			pt3, err := influxclient.NewPoint("resourcepool", respoolTags, respoolFields, time.Now())
@@ -625,6 +625,13 @@ func (vcenter *VCenter) Query(config Configuration, InfluxDBClient influxclient.
 		stdlog.Println("sent data to Influxdb")
 	}
 
+}
+
+func MBToKB(n int64) int64 {
+	if n != -1 {
+		n = 1000 * n
+	}
+	return n
 }
 
 func min(n ...int64) int64 {
@@ -691,7 +698,7 @@ func queryVCenter(vcenter VCenter, config Configuration, InfluxDBClient influxcl
 func main() {
 
 	flag.BoolVar(&debug, "debug", false, "Debug mode")
-	var cfgFile = flag.String("config", "/etc/"+path.Base(os.Args[0])+".json", "Config file to use. Default is /etc/"+path.Base(os.Args[0])+".json")
+	var cfgFile = flag.String("config","/etc/" + path.Base(os.Args[0])+".json", "Config file to use. Default is /etc/"+path.Base(os.Args[0])+".json")
 	flag.Parse()
 
 	stdlog = log.New(os.Stdout, "", log.Ldate|log.Ltime)
