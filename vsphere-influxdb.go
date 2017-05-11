@@ -21,8 +21,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/davecgh/go-spew/spew"
-	"golang.org/x/net/context"
 	"log"
 	"math"
 	"net/url"
@@ -31,6 +29,9 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/davecgh/go-spew/spew"
+	"golang.org/x/net/context"
 
 	influxclient "github.com/influxdata/influxdb/client/v2"
 	"github.com/vmware/govmomi"
@@ -219,6 +220,7 @@ func (vcenter *VCenter) Query(config Configuration, InfluxDBClient influxclient.
 		objectTypes = append(objectTypes, group.ObjectType)
 	}
 	objectTypes = append(objectTypes, "ClusterComputeResource")
+	objectTypes = append(objectTypes, "ResourcePool")
 
 	// Loop trought datacenters and create the intersting object reference list
 	mors := []types.ManagedObjectReference{}
@@ -246,6 +248,7 @@ func (vcenter *VCenter) Query(config Configuration, InfluxDBClient influxclient.
 	vm_refs := []types.ManagedObjectReference{}
 	host_refs := []types.ManagedObjectReference{}
 	cluster_refs := []types.ManagedObjectReference{}
+	respool_refs := []types.ManagedObjectReference{}
 
 	new_mors := []types.ManagedObjectReference{}
 
@@ -260,6 +263,8 @@ func (vcenter *VCenter) Query(config Configuration, InfluxDBClient influxclient.
 			new_mors = append(new_mors, mor)
 		} else if mor.Type == "ClusterComputeResource" {
 			cluster_refs = append(cluster_refs, mor)
+		} else if mor.Type == "ResourcePool" {
+			respool_refs = append(respool_refs, mor)
 		}
 	}
 	// Copy  the mors without the clusters
@@ -281,6 +286,43 @@ func (vcenter *VCenter) Query(config Configuration, InfluxDBClient influxclient.
 	if err != nil {
 		fmt.Println(err)
 		return
+	}
+
+	//Retrieve properties for ResourcePool
+	var rpmo []mo.ResourcePool
+	err = pc.Retrieve(ctx, respool_refs, []string{"summary"}, &rpmo)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	// Initialize the map that will hold the VM MOR to ResourcePool reference
+	vmToPool := make(map[types.ManagedObjectReference]string)
+
+	// Retrieve properties for ResourcePools
+	if len(respool_refs) > 0 {
+		if debug == true {
+			stdlog.Println("going inside ResourcePools")
+		}
+		var respool []mo.ResourcePool
+		err = pc.Retrieve(ctx, respool_refs, []string{"name", "config", "vm"}, &respool)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		for _, pool := range respool {
+			if debug == true {
+				stdlog.Println("---resourcepool name - you should see every resourcepool here (+VMs inside)----")
+				stdlog.Println(pool.Name)
+			}
+			for _, vm := range pool.Vm {
+				if debug == true {
+					stdlog.Println("--VM ID - you should see every VM ID here--")
+					stdlog.Println(vm)
+				}
+				vmToPool[vm] = pool.Name
+			}
+		}
 	}
 
 	// Initialize the map that will hold the VM MOR to cluster reference
@@ -317,6 +359,13 @@ func (vcenter *VCenter) Query(config Configuration, InfluxDBClient influxclient.
 		}
 	}
 
+	// Retrieve properties for the pools
+	respool_summary := make(map[types.ManagedObjectReference]map[string]string)
+	for _, pools := range rpmo {
+		respool_summary[pools.Self] = make(map[string]string)
+		respool_summary[pools.Self]["name"] = pools.Summary.GetResourcePoolSummary().Name
+	}
+
 	// Retrieve properties for the hosts
 	host_summary := make(map[types.ManagedObjectReference]map[string]string)
 	host_extra_metrics := make(map[types.ManagedObjectReference]map[string]int64)
@@ -342,6 +391,9 @@ func (vcenter *VCenter) Query(config Configuration, InfluxDBClient influxclient.
 		vm_summary[vm.Self]["datastore"] = strings.Replace(strings.Replace(re.FindString(fmt.Sprintln(vm.Summary.Config)), "[", "", -1), "]", "", -1)
 		if vmToCluster[vm.Self] != "" {
 			vm_summary[vm.Self]["cluster"] = vmToCluster[vm.Self]
+		}
+		if vmToPool[vm.Self] != "" {
+			vm_summary[vm.Self]["respool"] = vmToPool[vm.Self]
 		}
 		vm_summary[vm.Self]["esx"] = host_summary[*vm.Summary.Runtime.Host]["name"]
 	}
@@ -456,6 +508,12 @@ func (vcenter *VCenter) Query(config Configuration, InfluxDBClient influxclient.
 			}
 		}
 
+		if summary, ok := respool_summary[pem.Entity]; ok {
+			for key, tag := range summary {
+				tags[key] = tag
+			}
+		}
+
 		special_fields := make(map[string]map[string]map[string]map[string]interface{})
 		special_tags := make(map[string]map[string]map[string]map[string]string)
 		nowTime := time.Now()
@@ -538,6 +596,26 @@ func (vcenter *VCenter) Query(config Configuration, InfluxDBClient influxclient.
 				}
 			}
 		}
+
+		var respool []mo.ResourcePool
+		err = pc.Retrieve(ctx, respool_refs, []string{"name", "config", "vm"}, &respool)
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		for _, pool := range respool {
+			respoolFields := map[string]interface{}{
+				"cpu_limit":    pool.Config.CpuAllocation.GetResourceAllocationInfo().Limit,
+				"memory_limit": MBToKB(pool.Config.MemoryAllocation.GetResourceAllocationInfo().Limit),
+			}
+			respoolTags := map[string]string{"pool_name": pool.Name}
+			pt3, err := influxclient.NewPoint("resourcepool", respoolTags, respoolFields, time.Now())
+			if err != nil {
+				errlog.Println(err)
+			}
+			bp.AddPoint(pt3)
+		}
+
 	}
 	//InfluxDB send
 	err = InfluxDBClient.Write(bp)
@@ -547,6 +625,13 @@ func (vcenter *VCenter) Query(config Configuration, InfluxDBClient influxclient.
 		stdlog.Println("sent data to Influxdb")
 	}
 
+}
+
+func MBToKB(n int64) int64 {
+	if n != -1 {
+		n = 1000 * n
+	}
+	return n
 }
 
 func min(n ...int64) int64 {
@@ -613,6 +698,7 @@ func queryVCenter(vcenter VCenter, config Configuration, InfluxDBClient influxcl
 func main() {
 
 	flag.BoolVar(&debug, "debug", false, "Debug mode")
+	var cfgFile = flag.String("config","/etc/" + path.Base(os.Args[0])+".json", "Config file to use. Default is /etc/"+path.Base(os.Args[0])+".json")
 	flag.Parse()
 
 	stdlog = log.New(os.Stdout, "", log.Ldate|log.Ltime)
@@ -620,16 +706,16 @@ func main() {
 
 	stdlog.Println("Starting :", path.Base(os.Args[0]))
 	// read the configuration
-	file, err := os.Open("/etc/" + path.Base(os.Args[0]) + ".json")
+	file, err := os.Open(*cfgFile)
 	if err != nil {
-		errlog.Println("Could not open configuration file")
+		errlog.Println("Could not open configuration file " + *cfgFile)
 		errlog.Println(err)
 	}
 	jsondec := json.NewDecoder(file)
 	config := Configuration{}
 	err = jsondec.Decode(&config)
 	if err != nil {
-		errlog.Println("Could not decode configuration file")
+		errlog.Println("Could not decode configuration file " + *cfgFile)
 		errlog.Println(err)
 
 	}
